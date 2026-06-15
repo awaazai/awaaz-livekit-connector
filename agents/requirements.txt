@@ -1,0 +1,9 @@
+# echo_agent.py needs only these two:
+livekit-agents>=1.2.0
+livekit>=0.18.0
+
+# voice_agent.py additionally needs the plugin providers (swap as you like):
+livekit-plugins-deepgram>=1.0
+livekit-plugins-openai>=1.0
+livekit-plugins-elevenlabs>=1.0
+livekit-plugins-silero>=1.0

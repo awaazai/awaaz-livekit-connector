@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Secrets / local config
+.env
+
+# Test artifacts
+output.wav
+*.wav
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
