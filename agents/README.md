@@ -6,7 +6,7 @@ creates), so they work with live calls, not just a fixed test room.
 
 | Agent | Needs API keys? | Use it to... |
 |---|---|---|
-| `tone_agent.py` | No | Deterministic playback test: caller hears a steady tone the instant the agent joins. Proves connector -> mod_audio_fork -> caller. |
+| `tone_agent.py` | No | Deterministic playback test: caller hears a steady tone the instant the agent joins. Proves the connector → caller playback path. |
 | `echo_agent.py` | No | Echo the caller's audio back. Proves both legs with real (non-tone) audio. |
 | `voice_agent.py` | Yes | A real conversation (Deepgram STT + OpenAI LLM + ElevenLabs TTS) and the barge-in hook to copy into your own agent. |
 

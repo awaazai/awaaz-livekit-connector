@@ -1,21 +1,49 @@
 # Awaaz ⟷ LiveKit connector
 
-A standalone service that bridges the **Awaaz Media Streams** WebSocket protocol
-to a **LiveKit** room, so a LiveKit voice agent can take phone calls hosted on
-the Awaaz platform.
+Connect your **LiveKit voice agent** to real phone calls on the **Awaaz**
+platform.
 
-It plays the same role as LiveKit's hosted Twilio connector (`ConnectTwilioCall`),
-but for Awaaz's protocol — which you run yourself. **Your agent code does not
-change**; this service sits in front of it.
+Awaaz runs the phone system and makes/receives the calls. You run a LiveKit
+voice agent. This small service — the **connector** — sits between them: when a
+call happens, Awaaz streams the live call audio to the connector over a
+WebSocket, and the connector puts that audio into a LiveKit room where your agent
+is waiting. Your agent talks back, and the connector sends that audio to the
+caller.
+
+**You do not need to know anything about telephony.** You run two things — this
+connector and your LiveKit agent — and give Awaaz one URL.
 
 ```
-  Awaaz telephony            this connector              your LiveKit
-  (mod_audio_fork)                                          agent
-        |   Awaaz Media Streams      |        WebRTC (room)     |
-        |   WebSocket, L16 8k        |                          |
-        | -------------------------> | -----------------------> |   caller audio
-        | <------------------------- | <----------------------- |   agent audio
+   Awaaz                         YOU run this
+ (the phone                ┌─────────────────────────────┐
+  network)                 │                             │
+   caller  ──── call ────► │  connector  ───►  LiveKit   │
+                           │             ◄───   agent    │
+                           └─────────────────────────────┘
+        Awaaz streams the call audio to your connector over a WebSocket.
+        The connector bridges it into a LiveKit room with your agent.
 ```
+
+## What you do (the whole job)
+
+1. Run the **connector** somewhere with a public address (so Awaaz can reach it).
+2. Run your **LiveKit agent** (a normal LiveKit agent — sample agents included).
+3. Give Awaaz the connector's **`wss://` URL**. Awaaz handles phone numbers,
+   dialing, and call routing on their side.
+
+That's it. Your agent code is a standard LiveKit agent — the connector requires
+no changes to it.
+
+## What you need
+
+- **Python 3.10+** to run the connector (or Docker — image included).
+- A **LiveKit project** — either [LiveKit Cloud](https://cloud.livekit.io)
+  (free tier is fine) or a self-hosted LiveKit server. You'll need its URL, API
+  key, and API secret.
+- For the full sample voice agent: API keys for your speech/LLM providers
+  (Deepgram, OpenAI, ElevenLabs by default — easily swapped).
+- A way to expose the connector publicly: for testing, [ngrok](https://ngrok.com);
+  for production, any server/cloud with a public HTTPS address.
 
 ## Repo layout
 
@@ -24,162 +52,152 @@ connector.py          the bridge (Awaaz WebSocket <-> LiveKit room)
 requirements.txt      connector deps
 .env.example          config template (copy to .env)
 Dockerfile            connector container image
-agents/               sample LiveKit agents + their deploy files
-  tone_agent.py         deterministic playback test (no API keys)
-  echo_agent.py         echo caller audio back (no API keys)
-  voice_agent.py        full STT/LLM/TTS conversation + barge-in
+agents/               sample LiveKit agents you can run or copy from
+  tone_agent.py         plays a test tone (no API keys) — quickest check
+  echo_agent.py         echoes the caller back (no API keys)
+  voice_agent.py        full talking agent (STT + LLM + TTS) + barge-in
   Dockerfile            agent image for LiveKit Cloud
   livekit.toml          LiveKit Cloud agent config template
   README.md             how to run/deploy the agents
 ```
 
-## Three pieces (know what runs where)
+---
 
-| Piece | What it is | Who hosts it |
-|---|---|---|
-| **Connector** | This service. Bridges Awaaz WebSocket ⟷ a LiveKit room. | **Always you** — near your FreeSWITCH. |
-| **LiveKit SFU** | The media server that rooms live in. | LiveKit Cloud **or** self-hosted by you. |
-| **Agent** | Your LiveKit voice agent (STT/LLM/TTS). | LiveKit Cloud **or** locally by you. |
+# Quick start (test it on your laptop in ~10 minutes)
 
-The connector is required in **both** deployment paths below — it is your bridge
-and is never hosted by LiveKit.
+This runs everything locally and uses ngrok to give Awaaz a temporary URL.
 
-## How it differs from a Twilio connector
+**1. Get the connector running**
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# edit .env: paste your LiveKit URL / API key / API secret
+set -a && source .env && set +a
+python connector.py
+```
 
-The Awaaz protocol is the **same shape** as Twilio Media Streams
-(`start` / `media` / `dtmf` / `mark` / `clear` / `stop`), with these differences.
-If you adapt existing Twilio code (e.g. Pipecat's `TwilioFrameSerializer`),
-change exactly these:
+**2. Start a sample agent** (new terminal). The tone agent needs no API keys:
+```bash
+cd agents
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+set -a && source ../.env && set +a
+python tone_agent.py dev
+```
 
-| | Twilio Media Streams | Awaaz Media Streams |
-|---|---|---|
-| Caller audio (inbound) | base64 **μ-law** 8 kHz | base64 **linear 16-bit PCM** 8 kHz |
-| Playback audio (outbound) | base64 μ-law | base64 **WAV** (44-byte header + L16 8 kHz PCM) |
-| JSON keys | camelCase (`streamSid`) | snake_case (`stream_sid`) |
-| First message | `connected` then `start` | `start` (then `connected`) |
+**3. Expose the connector** (new terminal):
+```bash
+ngrok http 8080
+```
+ngrok prints a URL like `https://abc123.ngrok-free.app`. The connector URL is the
+same host with `wss://`: **`wss://abc123.ngrok-free.app`**.
 
-> The #1 mistake porting from Twilio is leaving the μ-law decode in place.
-> Awaaz audio is linear PCM. Also note the **outbound** `media` payload must be a
-> WAV file: `mod_audio_fork` skips a 44-byte header before playing the PCM.
-
-Full protocol spec: https://docs.awaaz.de/voice-hosting/websocket
+**4. Give that `wss://` URL to Awaaz** and place a test call. You should hear a
+steady tone — that confirms the whole path works. Then swap the tone agent for
+`echo_agent.py` (speak, hear yourself) or `voice_agent.py` (a real conversation).
+See [`agents/README.md`](agents/README.md).
 
 ---
 
-# Deployment
+# Going to production
 
-Two supported paths. Both run the connector; they differ in where the LiveKit
-SFU and your agent live.
+When you're ready, two things change from the quick start: the connector needs a
+**permanent** public address (not ngrok), and you choose where LiveKit runs.
 
-## Path A — LiveKit Cloud (easiest to start)
+## Where LiveKit runs — two options
 
-LiveKit hosts the SFU; you run the connector, and run the agent either locally
-(recommended, see below) or on LiveKit Cloud.
+| | Path A: LiveKit Cloud | Path B: Self-hosted LiveKit |
+|---|---|---|
+| LiveKit server | Hosted by LiveKit | You run it (Docker) |
+| Setup effort | Lowest | More, but full control |
+| Latency | Good (pick a nearby region) | Lowest (everything on your network) |
 
-1. **Create a LiveKit Cloud project** at https://cloud.livekit.io.
-   Settings → Keys: copy `LIVEKIT_URL` (`wss://<proj>.livekit.cloud`),
-   `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`.
-2. **Deploy the connector** on your own infra near FreeSWITCH
-   (see *Connector deployment* below). Set the three values above in its env.
-3. **Run the agent**:
-   - **Locally (recommended):** `python agents/voice_agent.py start` on your own
-     host. It registers with your LiveKit Cloud project and is auto-dispatched.
-   - **On LiveKit Cloud:** from `agents/`, `lk agent create` (uses the included
-     `Dockerfile` + `livekit.toml`), set provider keys as secrets, `lk agent deploy`.
-4. **Point Awaaz** at the connector's public `wss://` URL.
+**Both paths require you to run the connector** — that part never changes.
 
-## Path B — Local / self-hosted (lowest latency)
+### Path A — LiveKit Cloud
+1. Create a project at https://cloud.livekit.io and copy its URL/key/secret into
+   the connector's `.env`.
+2. Deploy the connector (below) with a public `wss://` URL; give it to Awaaz.
+3. Run your agent — locally (recommended, see below) or on LiveKit Cloud using
+   the included `agents/Dockerfile` + `agents/livekit.toml` (`lk agent create`,
+   then `lk agent deploy`).
 
-You run everything — SFU, connector, agent — ideally co-located with (or near)
-your FreeSWITCH, so audio never leaves your network.
-
-1. **Run the LiveKit SFU** (Docker):
+### Path B — Self-hosted LiveKit
+1. Run a LiveKit server (Docker):
    ```bash
    docker run -d --name livekit -p 7880:7880 -p 7881:7881 -p 7882:7882/udp \
      -e LIVEKIT_KEYS="<key>: <secret>" livekit/livekit-server --bind 0.0.0.0
    ```
-   For production set real keys and expose the UDP media port (`7882`). Point the
-   connector/agent at `LIVEKIT_URL=ws://<host>:7880` (or `wss://` behind TLS).
-2. **Deploy the connector** on the same network (see below).
-3. **Run the agent** locally as a worker against the self-hosted SFU.
-4. **Point Awaaz** at the connector's `wss://` URL.
+   Point the connector and agent at `LIVEKIT_URL=ws://<host>:7880`.
+2. Deploy the connector (below) and run your agent on the same network.
 
-## Recommendation: run the agent locally
+## Deploy the connector (both paths)
 
-The audio loop is **caller → connector → LiveKit SFU → agent → back**. Each leg
-is a network hop, so latency is lowest when the components are close together.
-
-- **Run the agent locally**, co-located with the connector (and your telephony),
-  rather than far from it. This keeps the connector↔agent path short.
-- For the **lowest** latency, prefer **Path B**: self-host the SFU next to the
-  connector so the whole audio loop stays on your own network instead of
-  round-tripping to a cloud region on every frame.
-- If you do use **Path A** (Cloud SFU), pick the LiveKit region nearest your
-  connector/telephony to minimize the WAN legs.
-
-## Connector deployment (both paths)
-
-The connector is always self-hosted and needs a **stable public `wss://`
-endpoint** reachable from your FreeSWITCH box.
+The connector must be reachable from the internet so Awaaz can connect to it.
 
 ```bash
 docker build -t awaaz-connector .
 docker run -d --name connector -p 8080:8080 --env-file .env awaaz-connector
 ```
 
-1. Config via env (`.env`): `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
-   `LIVEKIT_API_SECRET`, `LIVEKIT_AGENT_NAME` (optional, for explicit dispatch),
-   `CONNECTOR_HOST`/`CONNECTOR_PORT`.
-2. Put a **TLS-terminating reverse proxy** in front (nginx, Caddy, ALB, etc.) so
-   Awaaz connects to `wss://connector.yourdomain.com`. The connector dials **out**
-   to the SFU, so it needs outbound 443 plus inbound 443 for the WebSocket.
-3. **Scale horizontally** behind a WebSocket-aware load balancer — each call is
-   an independent `Session`.
+- Configure it via `.env`: `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
+  `LIVEKIT_API_SECRET`, and optionally `LIVEKIT_AGENT_NAME`.
+- Put it behind **HTTPS/TLS** (a reverse proxy like nginx or Caddy, or your
+  cloud load balancer) so Awaaz can reach it at `wss://connector.yourdomain.com`.
+- Each call is independent, so you can run several instances behind a
+  WebSocket-capable load balancer to scale.
+
+## Recommendation: keep the agent close to the connector
+
+Audio travels **caller → Awaaz → connector → LiveKit → agent → back**. The fewer
+and shorter the network hops, the lower the delay the caller hears. So:
+
+- **Run your agent next to the connector** (same host or same network/region),
+  rather than far away.
+- For the lowest latency, use **Path B** (self-hosted LiveKit) co-located with
+  the connector and agent, so audio stays on one network.
+- On **Path A**, choose the LiveKit Cloud region closest to your connector. Ask
+  the Awaaz team which region their telephony runs in and deploy near it.
 
 ---
 
-# Quick start (local testing)
+# For developers: the Awaaz audio protocol
 
-Run everything locally and expose the connector with ngrok for a first
-end-to-end test. Sample agents and details in [`agents/README.md`](agents/README.md).
+You normally don't need this — the connector handles it. It's here for anyone
+adapting the connector or porting from another platform.
 
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env          # fill in your LiveKit project values
-set -a && source .env && set +a
-python connector.py
-# in another terminal, expose it:  ngrok http 8080
-# give Awaaz the wss:// form of the ngrok URL
+Awaaz uses a JSON-over-WebSocket protocol very similar to **Twilio Media
+Streams** (events `start` / `media` / `dtmf` / `mark` / `clear` / `stop`), with a
+few differences:
+
+| | Twilio Media Streams | Awaaz |
+|---|---|---|
+| Caller audio (incoming) | base64 **μ-law** 8 kHz | base64 **linear 16-bit PCM** 8 kHz |
+| Playback audio (outgoing) | base64 μ-law | base64 **WAV** (44-byte header + 16-bit PCM 8 kHz) |
+| JSON keys | camelCase (`streamSid`) | snake_case (`stream_sid`) |
+
+> If you adapt Twilio code (e.g. Pipecat's serializer): don't μ-law-decode —
+> Awaaz audio is linear PCM; and the audio you send back must be **WAV-wrapped**,
+> not raw PCM.
+
+Full spec: https://docs.awaaz.de/voice-hosting/websocket
+
+## Barge-in (interruptions)
+
+When the caller talks over the agent, the agent should tell the connector to
+discard the audio it already queued. It does this by publishing a small message
+on the LiveKit `audio_control` topic:
+
+```python
+# in your agent, when the user interrupts:
+await ctx.room.local_participant.publish_data(
+    b'{"event": "clear"}', topic="audio_control"
+)
 ```
 
-Then start an agent (separate terminal): `cd agents && python tone_agent.py dev`
-and place a call — you should hear a tone.
-
-## What the connector does
-
-1. Accepts the inbound Awaaz WebSocket (Awaaz dials out to you).
-2. On `start`: mints a LiveKit token, joins a room, publishes the caller's audio
-   track, and (optionally) dispatches your agent.
-   - Room/agent names can come from `custom_parameters` (`room_name`,
-     `agent_name`); otherwise the room is derived from `call_sid` and the agent
-     name from `LIVEKIT_AGENT_NAME`.
-3. **Caller → agent**: decodes each `media` payload (L16 8 kHz) into a LiveKit
-   `AudioSource`. LiveKit resamples to 48 kHz internally.
-4. **Agent → caller**: subscribes to the agent's track, resamples to 8 kHz,
-   rechunks to 20 ms frames, wraps each in a WAV header, sends `media` back.
-5. **DTMF**: relayed into the room on topic `dtmf`.
-6. **Barge-in**: forwarded to Awaaz when the agent publishes `{"event":"clear"}`
-   on the `audio_control` topic (see `agents/README.md`).
-
-## Notes
-
-- **Status**: reference implementation. Validate against your LiveKit version and
-  load-test before production.
-- **Sample rates**: all audio is pinned to 8 kHz mono telephony; LiveKit does the
-  8k↔48k resampling on both legs.
-- **Outbound payload**: each `media` payload is a WAV file (44-byte header +
-  320-byte L16 PCM = 364 bytes) because `mod_audio_fork` skips the header.
+The included `voice_agent.py` already does this. Without it, conversation still
+works — only interruptions won't cut off the agent cleanly.
 
 ## License
 
