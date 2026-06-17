@@ -64,65 +64,30 @@ agents/               sample LiveKit agents you can run or copy from
 
 # Call flow
 
-End to end, from Awaaz scheduling a call to live two-way audio with your agent.
-Every phone call is one WebSocket to the connector and one LiveKit room; the
-connector handles many of these concurrently (see [Going to production](#going-to-production)).
+How a single call works, end to end.
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant A as Awaaz platform
-    participant C as Caller (phone)
+    participant C as Caller
+    participant A as Awaaz
     participant K as Connector
-    participant L as LiveKit room
-    participant G as Agent
+    participant G as Your agent
 
-    Note over A: Scheduled message / campaign fires
-    A->>C: Dial the caller
-    C-->>A: Caller picks up
+    A->>C: Places the call
+    C-->>A: Caller answers
+    A->>K: Connects and starts the call
+    K->>G: Brings your agent into the call
 
-    A->>K: Open WebSocket (wss://)
-    A->>K: start (stream_sid, call_sid, custom_parameters)
+    Note over C,G: Caller and agent talk — live, both ways
+    C->>G: Caller speaks
+    G->>C: Agent responds
 
-    K->>L: connect as "caller-<call_sid>" (room_join token)
-    K->>L: publish caller-audio track (L16 8 kHz)
-    K->>L: create_dispatch(agent_name)  [explicit dispatch only]
-    G->>L: join room, publish agent audio track
-    L-->>K: track_subscribed (agent audio)
-
-    rect rgb(235, 245, 255)
-    Note over A,G: Live two-way audio (20 ms frames)
-    loop Caller speaks
-        C->>A: voice
-        A->>K: media (base64 L16 8 kHz)
-        K->>L: capture_frame -> caller track
-        L->>G: caller audio
-    end
-    loop Agent speaks
-        G->>L: agent audio (48 kHz)
-        L-->>K: frames (resampled to 8 kHz)
-        K->>A: media (WAV-wrapped L16, base64)
-        A->>C: voice
-    end
-    end
-
-    opt Caller presses a key
-        A->>K: dtmf (digit)
-        K->>L: publish_data topic="dtmf"
-        L->>G: dtmf packet
-    end
-
-    opt Caller interrupts agent (barge-in)
-        G->>L: publish_data topic="audio_control" {"event":"clear"}
-        L-->>K: data_received
-        K->>A: clear (flush buffered TTS)
-    end
-
-    Note over A,C: Call ends (either side hangs up)
-    A->>K: stop
-    K->>L: disconnect (room reaped when empty)
-    A-->>K: WebSocket closes
+    C-->>A: Call ends
+    A->>K: Tells the connector to stop
+    K->>G: Agent leaves, call cleaned up
 ```
+
+Each call is handled on its own, so many calls can run at the same time.
 
 ---
 
