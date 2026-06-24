@@ -28,6 +28,7 @@ import logging
 import os
 import signal
 import struct
+import time
 
 import websockets
 from livekit import api, rtc
@@ -50,6 +51,25 @@ LISTEN_PORT = int(os.environ.get("CONNECTOR_PORT", "8080"))
 SAMPLE_RATE = 8000
 NUM_CHANNELS = 1
 CHUNK_BYTES = 320  # bytes per outbound media frame (20 ms of L16 @ 8 kHz)
+
+# Latency tracing. A gap larger than this between two outbound agent frames is
+# treated as the start of a new agent utterance (i.e. the agent was "thinking").
+TURN_GAP_MS = 200
+# Warn when the inbound caller-audio queue backs up past this many frames
+# (each frame is 20 ms, so 25 frames == 500 ms of buffered latency).
+INBOUND_BACKLOG_WARN = 25
+# Inbound catch-up: capture_frame paces at real-time and can't drain a backlog,
+# so when the queue exceeds this many frames we drop the oldest (stale) ones to
+# stay live. 10 frames == 200 ms of allowed caller->agent latency.
+INBOUND_CATCHUP = 10
+
+# Agent speech-onset detection (outbound). The agent publishes a continuous
+# track (silence between utterances), so we detect "agent started speaking" by
+# audio energy: a frame whose peak sample exceeds this is treated as speech.
+AGENT_SPEECH_PEAK = 500
+# Require this many consecutive silent frames (20 ms each) before we consider
+# the agent to have stopped, so brief pauses within speech don't re-trigger.
+AGENT_SILENCE_HANGOVER = 25
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -99,6 +119,15 @@ class Session:
         self._chunk = 0
         self._ts_ms = 0
         self._outbuf = bytearray()
+        # latency tracing (monotonic ms)
+        self._last_send_ms = 0.0      # last outbound agent frame
+        self._last_inbound_ms = 0.0   # last inbound caller frame
+        self._clear_ms = 0.0          # last barge-in (clear) we forwarded
+        self._user_final_ms = 0.0     # caller's last finalized transcript
+        self._inbound_backlog_warned = False
+        self._agent_ready = False     # agent audio track subscribed yet?
+        self._agent_speaking = False  # energy-based speech state (outbound)
+        self._silence_run = 0         # consecutive silent outbound frames
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -172,6 +201,13 @@ class Session:
         self.room = rtc.Room()
         self.room.on("track_subscribed", self._on_track_subscribed)
         self.room.on("data_received", self._on_data_received)
+        # Latency tracing: the agent publishes its turn state and transcripts on
+        # these data streams. Without handlers LiveKit just logs "ignoring ...
+        # no callback attached"; with them we get the precise agent-side
+        # timeline (when the user's speech is finalized -> when the agent
+        # starts thinking/speaking), which is where response latency lives.
+        self.room.register_text_stream_handler("lk.transcription", self._on_transcription)
+        self.room.register_byte_stream_handler("lk.agent.session", self._on_agent_session)
         await self.room.connect(LIVEKIT_URL, token)
 
         # 2) publish the caller's audio (8 kHz mono; LiveKit resamples for us)
@@ -205,6 +241,22 @@ class Session:
         if not payload:
             return
         pcm = base64.b64decode(payload)
+        self._last_inbound_ms = time.monotonic() * 1000
+        # Don't buffer caller audio before the agent is actually listening:
+        # the LiveKit/agent startup can take many seconds, and anything queued
+        # in that window becomes permanent latency once draining begins.
+        if not self._agent_ready:
+            return
+        # A backed-up inbound queue means caller audio is reaching the agent
+        # late -> inbound transport latency. Warn once per backlog episode.
+        depth = self._inbound.qsize()
+        if depth >= INBOUND_BACKLOG_WARN:
+            if not self._inbound_backlog_warned:
+                log.warning("[%s] inbound caller-audio backlog: %d frames (~%d ms) queued -> agent hears caller late",
+                            self.stream_sid, depth, depth * 20)
+                self._inbound_backlog_warned = True
+        elif depth <= 2:
+            self._inbound_backlog_warned = False
         try:
             self._inbound.put_nowait(pcm)
         except asyncio.QueueFull:
@@ -229,6 +281,20 @@ class Session:
         assert self.source is not None
         while not self._closed.is_set():
             pcm = await self._inbound.get()
+            # Safety net: capture_frame paces at real-time and can't drain a
+            # backlog on its own, so if one develops mid-call we drop the
+            # oldest (stale) frames to catch back up to live rather than play
+            # the caller to the agent seconds late.
+            if self._inbound.qsize() > INBOUND_CATCHUP:
+                dropped = 0
+                while self._inbound.qsize() > INBOUND_CATCHUP:
+                    try:
+                        pcm = self._inbound.get_nowait()
+                        dropped += 1
+                    except asyncio.QueueEmpty:
+                        break
+                log.warning("[%s] inbound catch-up: dropped %d stale caller frames "
+                            "(~%d ms) to stay live", self.stream_sid, dropped, dropped * 20)
             frame = rtc.AudioFrame(
                 data=pcm,
                 sample_rate=SAMPLE_RATE,
@@ -243,6 +309,10 @@ class Session:
     def _on_track_subscribed(self, track: rtc.Track, *_):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             log.info("[%s] subscribed to agent audio track", self.stream_sid)
+            # The call is now truly live: start accepting caller audio. Anything
+            # Awaaz sent during startup was dropped (agent wasn't listening), so
+            # we begin from live with no inherited backlog.
+            self._agent_ready = True
             self._tasks.append(asyncio.create_task(self._pump_agent_audio(track)))
 
     async def _pump_agent_audio(self, track: rtc.Track):
@@ -264,11 +334,47 @@ class Session:
         self._seq += 1
         self._chunk += 1
         self._ts_ms += 20
+        now = time.monotonic() * 1000
         if self._chunk == 1:
             log.info("[%s] sending FIRST media frame to Awaaz (%d B PCM + 44 B WAV)",
                      self.stream_sid, len(pcm))
-        elif self._chunk % 50 == 0:
-            log.info("[%s] sent %d media frames to Awaaz", self.stream_sid, self._chunk)
+        else:
+            # A gap since the previous outbound frame means the agent went quiet
+            # and is now resuming -> the gap is the agent's "thinking" latency.
+            gap = now - self._last_send_ms
+            if gap > TURN_GAP_MS:
+                src = "barge-in clear" if self._clear_ms else "caller audio"
+                ref = self._clear_ms or self._last_inbound_ms
+                latency = (now - ref) if ref else gap
+                log.info("[%s] agent audio resumed after %.0f ms gap "
+                         "(%.0f ms since %s) -> agent-thinking latency",
+                         self.stream_sid, gap, latency, src)
+                self._clear_ms = 0.0
+            if self._chunk % 50 == 0:
+                log.info("[%s] sent %d media frames to Awaaz (outbuf=%d B, inbound_q=%d)",
+                         self.stream_sid, self._chunk, len(self._outbuf), self._inbound.qsize())
+        self._last_send_ms = now
+
+        # Energy-based speech-onset detection. The agent track is continuous
+        # (silence between utterances), so the silence->speech transition is the
+        # real "agent started talking" moment -> time-to-first-word latency.
+        samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+        peak = max(map(abs, samples)) if samples else 0
+        if peak >= AGENT_SPEECH_PEAK:
+            self._silence_run = 0
+            if not self._agent_speaking:
+                self._agent_speaking = True
+                if self._user_final_ms:
+                    log.info("[%s] agent speech onset: %.0f ms since caller stopped (turnaround latency)",
+                             self.stream_sid, now - self._user_final_ms)
+                    self._user_final_ms = 0.0  # report once per caller turn
+                else:
+                    log.info("[%s] agent speech onset", self.stream_sid)
+        elif self._agent_speaking:
+            self._silence_run += 1
+            if self._silence_run >= AGENT_SILENCE_HANGOVER:
+                self._agent_speaking = False
+                self._silence_run = 0
         # mod_audio_fork skips a 44-byte WAV header on playback, so wrap the PCM.
         wav = _wav_header(len(pcm)) + pcm
         await self._send({
@@ -283,6 +389,7 @@ class Session:
         })
 
     async def _send_clear(self):
+        self._clear_ms = time.monotonic() * 1000
         await self._send({"event": "clear", "stream_sid": self.stream_sid})
         log.info("[%s] sent clear (barge-in) -> Awaaz", self.stream_sid)
 
@@ -308,6 +415,58 @@ class Session:
         if payload.get("event") == "clear":
             self._outbuf.clear()
             asyncio.create_task(self._send_clear())
+
+    # -- agent turn timeline (latency tracing) ----------------------------
+
+    def _on_transcription(self, reader, participant_identity: str):
+        """`lk.transcription` text stream: user/agent transcript segments.
+        The `lk.transcription_final` attribute marks the end of a segment; a
+        final user segment is effectively 'caller stopped talking', and the
+        first agent segment is 'agent started replying' -> the gap between them
+        is the agent-thinking latency."""
+        asyncio.create_task(self._log_transcription(reader, participant_identity))
+
+    async def _log_transcription(self, reader, identity: str):
+        try:
+            attrs = reader.info.attributes or {}
+            text = await reader.read_all()
+        except Exception as e:  # noqa: BLE001 - never let tracing kill the call
+            log.debug("[%s] transcription read failed: %s", self.stream_sid, e)
+            return
+        final = str(attrs.get("lk.transcription_final", "")).lower() == "true"
+        # Mark the moment the caller's speech is finalized so the next agent
+        # audio frame can be attributed to agent-thinking time.
+        if final and "caller-" in (identity or ""):
+            self._user_final_ms = time.monotonic() * 1000
+        log.info("[%s] transcript from=%s final=%s: %s",
+                 self.stream_sid, identity, final, (text or "").strip()[:120])
+
+    def _on_agent_session(self, reader, participant_identity: str):
+        """`lk.agent.session` byte stream: agent state updates (e.g.
+        listening/thinking/speaking). State transitions are the cleanest
+        agent-side latency signal."""
+        asyncio.create_task(self._log_agent_session(reader, participant_identity))
+
+    async def _log_agent_session(self, reader, identity: str):
+        try:
+            data = await reader.read_all()
+        except Exception as e:  # noqa: BLE001
+            log.debug("[%s] agent.session read failed: %s", self.stream_sid, e)
+            return
+        now = time.monotonic() * 1000
+        raw = data.decode(errors="replace") if isinstance(data, (bytes, bytearray)) else str(data)
+        state = None
+        try:
+            obj = json.loads(raw)
+            state = obj.get("state") if isinstance(obj, dict) else None
+        except ValueError:
+            pass
+        ref = self._user_final_ms
+        since = f" ({now - ref:.0f} ms since caller-final)" if ref else ""
+        # Show parsed state when present; otherwise surface the raw payload so
+        # the real schema is visible the first time this runs.
+        detail = f"state={state}" if state is not None else f"raw={raw.strip()[:120]}"
+        log.info("[%s] agent.session %s%s", self.stream_sid, detail, since)
 
 
 async def _handler(ws: websockets.WebSocketServerProtocol):
