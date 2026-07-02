@@ -71,6 +71,16 @@ AGENT_SPEECH_PEAK = 500
 # the agent to have stopped, so brief pauses within speech don't re-trigger.
 AGENT_SILENCE_HANGOVER = 25
 
+# Same energy-based detection, applied to inbound caller audio (Awaaz -> us).
+# Lets us tell, from connector logs alone, when the caller is actually
+# speaking vs when inbound frames are silence/comfort noise -- useful for
+# telling real audio dropouts apart from "the caller just wasn't talking".
+CALLER_SPEECH_PEAK = 500
+CALLER_SILENCE_HANGOVER = 25
+# Log a running volume/jitter summary every N frames (20 ms each) -- same
+# cadence for both directions so the two logs line up for comparison.
+FRAME_LOG_EVERY = 50
+
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
@@ -128,6 +138,14 @@ class Session:
         self._agent_ready = False     # agent audio track subscribed yet?
         self._agent_speaking = False  # energy-based speech state (outbound)
         self._silence_run = 0         # consecutive silent outbound frames
+        # volume/jitter tracing, reset every FRAME_LOG_EVERY frames per direction
+        self._inbound_frame_count = 0
+        self._inbound_peak_since_log = 0
+        self._inbound_max_gap_since_log = 0.0
+        self._caller_speaking = False     # energy-based speech state (inbound)
+        self._caller_silence_run = 0      # consecutive silent inbound frames
+        self._outbound_peak_since_log = 0
+        self._outbound_max_gap_since_log = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -241,7 +259,39 @@ class Session:
         if not payload:
             return
         pcm = base64.b64decode(payload)
-        self._last_inbound_ms = time.monotonic() * 1000
+        now = time.monotonic() * 1000
+        if self._last_inbound_ms:
+            gap = now - self._last_inbound_ms
+            if gap > self._inbound_max_gap_since_log:
+                self._inbound_max_gap_since_log = gap
+        self._last_inbound_ms = now
+
+        # Volume/speech tracing runs even before the agent is ready, so a
+        # dead-air call (agent never subscribes) still shows whether the
+        # caller was talking into the void the whole time.
+        self._inbound_frame_count += 1
+        samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+        peak = max(map(abs, samples)) if samples else 0
+        self._inbound_peak_since_log = max(self._inbound_peak_since_log, peak)
+        if peak >= CALLER_SPEECH_PEAK:
+            self._caller_silence_run = 0
+            if not self._caller_speaking:
+                self._caller_speaking = True
+                log.info("[%s] caller speech onset (peak=%d)", self.stream_sid, peak)
+        elif self._caller_speaking:
+            self._caller_silence_run += 1
+            if self._caller_silence_run >= CALLER_SILENCE_HANGOVER:
+                self._caller_speaking = False
+                self._caller_silence_run = 0
+                log.info("[%s] caller speech end", self.stream_sid)
+        if self._inbound_frame_count % FRAME_LOG_EVERY == 0:
+            log.info("[%s] received %d inbound frames from Awaaz "
+                      "(peak=%d, max_gap=%.0fms, agent_ready=%s, backlog=%d)",
+                      self.stream_sid, self._inbound_frame_count, self._inbound_peak_since_log,
+                      self._inbound_max_gap_since_log, self._agent_ready, self._inbound.qsize())
+            self._inbound_peak_since_log = 0
+            self._inbound_max_gap_since_log = 0.0
+
         # Don't buffer caller audio before the agent is actually listening:
         # the LiveKit/agent startup can take many seconds, and anything queued
         # in that window becomes permanent latency once draining begins.
@@ -335,6 +385,16 @@ class Session:
         self._chunk += 1
         self._ts_ms += 20
         now = time.monotonic() * 1000
+
+        # Energy-based speech-onset detection. The agent track is continuous
+        # (silence between utterances), so the silence->speech transition is the
+        # real "agent started talking" moment -> time-to-first-word latency.
+        # Computed up front so both the periodic log below and the onset
+        # detection further down can use it.
+        samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+        peak = max(map(abs, samples)) if samples else 0
+        self._outbound_peak_since_log = max(self._outbound_peak_since_log, peak)
+
         if self._chunk == 1:
             log.info("[%s] sending FIRST media frame to Awaaz (%d B PCM + 44 B WAV)",
                      self.stream_sid, len(pcm))
@@ -342,6 +402,7 @@ class Session:
             # A gap since the previous outbound frame means the agent went quiet
             # and is now resuming -> the gap is the agent's "thinking" latency.
             gap = now - self._last_send_ms
+            self._outbound_max_gap_since_log = max(self._outbound_max_gap_since_log, gap)
             if gap > TURN_GAP_MS:
                 src = "barge-in clear" if self._clear_ms else "caller audio"
                 ref = self._clear_ms or self._last_inbound_ms
@@ -350,16 +411,15 @@ class Session:
                          "(%.0f ms since %s) -> agent-thinking latency",
                          self.stream_sid, gap, latency, src)
                 self._clear_ms = 0.0
-            if self._chunk % 50 == 0:
-                log.info("[%s] sent %d media frames to Awaaz (outbuf=%d B, inbound_q=%d)",
-                         self.stream_sid, self._chunk, len(self._outbuf), self._inbound.qsize())
+            if self._chunk % FRAME_LOG_EVERY == 0:
+                log.info("[%s] sent %d media frames to Awaaz "
+                         "(outbuf=%d B, inbound_q=%d, peak=%d, max_gap=%.0fms)",
+                         self.stream_sid, self._chunk, len(self._outbuf), self._inbound.qsize(),
+                         self._outbound_peak_since_log, self._outbound_max_gap_since_log)
+                self._outbound_peak_since_log = 0
+                self._outbound_max_gap_since_log = 0.0
         self._last_send_ms = now
 
-        # Energy-based speech-onset detection. The agent track is continuous
-        # (silence between utterances), so the silence->speech transition is the
-        # real "agent started talking" moment -> time-to-first-word latency.
-        samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
-        peak = max(map(abs, samples)) if samples else 0
         if peak >= AGENT_SPEECH_PEAK:
             self._silence_run = 0
             if not self._agent_speaking:
