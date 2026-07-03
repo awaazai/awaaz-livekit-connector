@@ -71,6 +71,11 @@ AGENT_SPEECH_PEAK = 500
 # the agent to have stopped, so brief pauses within speech don't re-trigger.
 AGENT_SILENCE_HANGOVER = 25
 
+# After each agent speech onset, log the exact per-frame gap/peak for this many
+# frames (150 * 20ms = 3s) instead of only the periodic 1s summary -- narrow
+# enough to see a bursty/uneven delivery pattern that a 1s max would hide.
+ONSET_TRACE_FRAMES = 150
+
 # Same energy-based detection, applied to inbound caller audio (Awaaz -> us).
 # Lets us tell, from connector logs alone, when the caller is actually
 # speaking vs when inbound frames are silence/comfort noise -- useful for
@@ -146,6 +151,7 @@ class Session:
         self._caller_silence_run = 0      # consecutive silent inbound frames
         self._outbound_peak_since_log = 0
         self._outbound_max_gap_since_log = 0.0
+        self._onset_trace_remaining = 0  # frames left to per-frame-trace after an onset
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -403,6 +409,11 @@ class Session:
             # and is now resuming -> the gap is the agent's "thinking" latency.
             gap = now - self._last_send_ms
             self._outbound_max_gap_since_log = max(self._outbound_max_gap_since_log, gap)
+            if self._onset_trace_remaining > 0:
+                log.info("[%s] onset-trace frame #%d: gap=%.1fms peak=%d",
+                         self.stream_sid, ONSET_TRACE_FRAMES - self._onset_trace_remaining + 1,
+                         gap, peak)
+                self._onset_trace_remaining -= 1
             if gap > TURN_GAP_MS:
                 src = "barge-in clear" if self._clear_ms else "caller audio"
                 ref = self._clear_ms or self._last_inbound_ms
@@ -412,7 +423,8 @@ class Session:
                          self.stream_sid, gap, latency, src)
                 self._clear_ms = 0.0
             if self._chunk % FRAME_LOG_EVERY == 0:
-                log.info("[%s] sent %d media frames to Awaaz "
+                log.info("[%s] sent %d media frames to Awaaz"
+                         " "
                          "(outbuf=%d B, inbound_q=%d, peak=%d, max_gap=%.0fms)",
                          self.stream_sid, self._chunk, len(self._outbuf), self._inbound.qsize(),
                          self._outbound_peak_since_log, self._outbound_max_gap_since_log)
@@ -424,6 +436,7 @@ class Session:
             self._silence_run = 0
             if not self._agent_speaking:
                 self._agent_speaking = True
+                self._onset_trace_remaining = ONSET_TRACE_FRAMES
                 if self._user_final_ms:
                     log.info("[%s] agent speech onset: %.0f ms since caller stopped (turnaround latency)",
                              self.stream_sid, now - self._user_final_ms)
