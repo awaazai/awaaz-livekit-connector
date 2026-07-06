@@ -1,0 +1,19 @@
+[Unit]
+Description=Awaaz Voice Connector (LiveKit bridge)
+After=network.target
+
+[Service]
+Type=simple
+User=awaazde
+WorkingDirectory=/home/awaazde/www/awaaz-livekit-connector
+EnvironmentFile=/home/awaazde/www/awaaz-livekit-connector/.env
+ExecStart=/home/awaazde/www/awaaz-livekit-connector/.venv/bin/python connector.py
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=append:/var/log/awaaz-connector.log
+StandardError=append:/var/log/awaaz-connector.log
+
+[Install]
+WantedBy=multi-user.target
