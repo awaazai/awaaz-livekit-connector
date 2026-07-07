@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import array
 import asyncio
 import base64
 import json
@@ -39,9 +40,6 @@ import os
 import random
 import signal
 import struct
-import subprocess
-import sys
-import tempfile
 import time
 import wave
 
@@ -77,28 +75,44 @@ def _wav_header(data_len: int, rate: int = SAMPLE_RATE,
     )
 
 
+def _resample_linear(samples: array.array, src_rate: int, dst_rate: int) -> array.array:
+    """Simple linear-interpolation resampler (stdlib only, no ffmpeg/numpy).
+    No anti-alias filtering, but that's fine here: the 48kHz test file was
+    itself upsampled from an 8kHz source, so there's no energy above 4kHz to
+    alias -- good enough for a jitter test tool, not a general-purpose DSP."""
+    ratio = dst_rate / src_rate
+    n_in = len(samples)
+    n_out = int(n_in * ratio)
+    out = array.array("h", bytes(2 * n_out))
+    for i in range(n_out):
+        src_pos = i / ratio
+        idx = int(src_pos)
+        frac = src_pos - idx
+        a = samples[idx]
+        b = samples[idx + 1] if idx + 1 < n_in else a
+        out[i] = int(a + (b - a) * frac)
+    return out
+
+
 def load_playback_audio(path: str) -> bytes:
-    """Load a mono 16-bit WAV, resampling to 8kHz via ffmpeg if needed --
-    mirrors the 48kHz agent-track -> 8kHz downsample connector.py performs."""
+    """Load a mono 16-bit WAV, resampling to 8kHz if needed -- mirrors the
+    48kHz agent-track -> 8kHz downsample connector.py performs."""
     with wave.open(path, "rb") as wf:
-        rate, channels, width = wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
+        rate = wf.getframerate()
+        channels = wf.getnchannels()
+        width = wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
     if channels != 1 or width != 2:
         raise SystemExit(f"{path} must be mono 16-bit PCM (got {channels}ch, {width * 8}-bit)")
 
     if rate == SAMPLE_RATE:
-        with wave.open(path, "rb") as wf:
-            return wf.readframes(wf.getnframes())
+        return raw
 
-    log.info("resampling %s from %d Hz to %d Hz via ffmpeg (mimics agent-track downsample)",
-             path, rate, SAMPLE_RATE)
-    with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", path,
-             "-ar", str(SAMPLE_RATE), "-ac", "1", "-sample_fmt", "s16", tmp.name],
-            check=True,
-        )
-        with wave.open(tmp.name, "rb") as wf:
-            return wf.readframes(wf.getnframes())
+    log.info("resampling %s from %d Hz to %d Hz (mimics agent-track downsample)",
+              path, rate, SAMPLE_RATE)
+    samples = array.array("h")
+    samples.frombytes(raw)
+    return _resample_linear(samples, rate, SAMPLE_RATE).tobytes()
 
 
 class Session:
