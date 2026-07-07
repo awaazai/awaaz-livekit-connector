@@ -87,13 +87,12 @@ CALLER_SILENCE_HANGOVER = 25
 # cadence for both directions so the two logs line up for comparison.
 FRAME_LOG_EVERY = 50
 
-# Debug: dump the first DEBUG_CAPTURE_SECONDS of agent audio (post-resample,
-# pre-WAV-wrap, i.e. exactly what _send_media receives) to a local WAV file
-# per call, to isolate whether an artifact (e.g. background buzz) is already
-# present before the connector sends it, or introduced downstream. Set
-# DEBUG_CAPTURE_AGENT_AUDIO to a writable directory to enable; empty disables.
+# Debug: dump the full agent audio for each call (post-resample, pre-WAV-wrap,
+# i.e. exactly what _send_media receives) to a local WAV file, to isolate
+# whether an artifact (e.g. background buzz) is already present before the
+# connector sends it, or introduced downstream. Set DEBUG_CAPTURE_AGENT_AUDIO
+# to a writable directory to enable; empty disables.
 DEBUG_CAPTURE_AGENT_AUDIO = os.environ.get("DEBUG_CAPTURE_AGENT_AUDIO", "")
-DEBUG_CAPTURE_SECONDS = float(os.environ.get("DEBUG_CAPTURE_SECONDS", "10"))
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -164,7 +163,6 @@ class Session:
         # debug capture of raw agent audio (see DEBUG_CAPTURE_AGENT_AUDIO)
         self._capture_wav: wave.Wave_write | None = None
         self._capture_frames_written = 0
-        self._capture_max_frames = int(DEBUG_CAPTURE_SECONDS * SAMPLE_RATE)
         self._capture_done = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -403,8 +401,7 @@ class Session:
             log.warning("[%s] could not open debug capture file %s: %s", self.stream_sid, path, e)
             return
         self._capture_wav = wf
-        log.info("[%s] debug capture: writing first %.0fs of agent audio to %s",
-                  self.stream_sid, DEBUG_CAPTURE_SECONDS, path)
+        log.info("[%s] debug capture: writing full agent audio to %s", self.stream_sid, path)
 
     async def _pump_agent_audio(self, track: rtc.Track):
         # Ask LiveKit to resample the agent's audio (usually 48 kHz) down to 8 kHz.
@@ -503,8 +500,6 @@ class Session:
             return
         self._capture_wav.writeframes(pcm)
         self._capture_frames_written += len(pcm) // 2
-        if self._capture_frames_written >= self._capture_max_frames:
-            self._close_capture()
 
     def _close_capture(self):
         if self._capture_wav is None or self._capture_done:
