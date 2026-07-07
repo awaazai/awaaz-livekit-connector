@@ -29,6 +29,7 @@ import os
 import signal
 import struct
 import time
+import wave
 
 import websockets
 from livekit import api, rtc
@@ -85,6 +86,14 @@ CALLER_SILENCE_HANGOVER = 25
 # Log a running volume/jitter summary every N frames (20 ms each) -- same
 # cadence for both directions so the two logs line up for comparison.
 FRAME_LOG_EVERY = 50
+
+# Debug: dump the first DEBUG_CAPTURE_SECONDS of agent audio (post-resample,
+# pre-WAV-wrap, i.e. exactly what _send_media receives) to a local WAV file
+# per call, to isolate whether an artifact (e.g. background buzz) is already
+# present before the connector sends it, or introduced downstream. Set
+# DEBUG_CAPTURE_AGENT_AUDIO to a writable directory to enable; empty disables.
+DEBUG_CAPTURE_AGENT_AUDIO = os.environ.get("DEBUG_CAPTURE_AGENT_AUDIO", "")
+DEBUG_CAPTURE_SECONDS = float(os.environ.get("DEBUG_CAPTURE_SECONDS", "10"))
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -152,6 +161,11 @@ class Session:
         self._outbound_peak_since_log = 0
         self._outbound_max_gap_since_log = 0.0
         self._onset_trace_remaining = 0  # frames left to per-frame-trace after an onset
+        # debug capture of raw agent audio (see DEBUG_CAPTURE_AGENT_AUDIO)
+        self._capture_wav: wave.Wave_write | None = None
+        self._capture_frames_written = 0
+        self._capture_max_frames = int(DEBUG_CAPTURE_SECONDS * SAMPLE_RATE)
+        self._capture_done = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -168,6 +182,7 @@ class Session:
         if self._closed.is_set():
             return
         self._closed.set()
+        self._close_capture()
         for t in self._tasks:
             t.cancel()
         if self.room is not None:
@@ -369,7 +384,27 @@ class Session:
             # Awaaz sent during startup was dropped (agent wasn't listening), so
             # we begin from live with no inherited backlog.
             self._agent_ready = True
+            self._maybe_open_capture()
             self._tasks.append(asyncio.create_task(self._pump_agent_audio(track)))
+
+    def _maybe_open_capture(self):
+        if not DEBUG_CAPTURE_AGENT_AUDIO:
+            return
+        path = os.path.join(
+            DEBUG_CAPTURE_AGENT_AUDIO,
+            f"agent_audio_{self.stream_sid or 'unknown'}_{int(time.time())}.wav",
+        )
+        try:
+            wf = wave.open(path, "wb")
+            wf.setnchannels(NUM_CHANNELS)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+        except OSError as e:
+            log.warning("[%s] could not open debug capture file %s: %s", self.stream_sid, path, e)
+            return
+        self._capture_wav = wf
+        log.info("[%s] debug capture: writing first %.0fs of agent audio to %s",
+                  self.stream_sid, DEBUG_CAPTURE_SECONDS, path)
 
     async def _pump_agent_audio(self, track: rtc.Track):
         # Ask LiveKit to resample the agent's audio (usually 48 kHz) down to 8 kHz.
@@ -400,6 +435,8 @@ class Session:
         samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
         peak = max(map(abs, samples)) if samples else 0
         self._outbound_peak_since_log = max(self._outbound_peak_since_log, peak)
+
+        self._capture_write(pcm)
 
         if self._chunk == 1:
             log.info("[%s] sending FIRST media frame to Awaaz (%d B PCM + 44 B WAV)",
@@ -460,6 +497,22 @@ class Session:
                 "payload": base64.b64encode(wav).decode(),
             },
         })
+
+    def _capture_write(self, pcm: bytes):
+        if self._capture_wav is None or self._capture_done:
+            return
+        self._capture_wav.writeframes(pcm)
+        self._capture_frames_written += len(pcm) // 2
+        if self._capture_frames_written >= self._capture_max_frames:
+            self._close_capture()
+
+    def _close_capture(self):
+        if self._capture_wav is None or self._capture_done:
+            return
+        self._capture_done = True
+        self._capture_wav.close()
+        log.info("[%s] debug capture: done (%.1fs written)",
+                  self.stream_sid, self._capture_frames_written / SAMPLE_RATE)
 
     async def _send_clear(self):
         self._clear_ms = time.monotonic() * 1000
