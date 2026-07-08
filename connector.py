@@ -52,6 +52,7 @@ LISTEN_PORT = int(os.environ.get("CONNECTOR_PORT", "8080"))
 SAMPLE_RATE = 8000
 NUM_CHANNELS = 1
 CHUNK_BYTES = 320  # bytes per outbound media frame (20 ms of L16 @ 8 kHz)
+FRAME_MS = 20
 
 # Latency tracing. A gap larger than this between two outbound agent frames is
 # treated as the start of a new agent utterance (i.e. the agent was "thinking").
@@ -63,6 +64,16 @@ INBOUND_BACKLOG_WARN = 25
 # so when the queue exceeds this many frames we drop the oldest (stale) ones to
 # stay live. 10 frames == 200 ms of allowed caller->agent latency.
 INBOUND_CATCHUP = 10
+
+# Outbound (agent -> caller) catch-up: LiveKit's own delivery timing has some
+# natural network/SFU jitter (confirmed via connector logs: onset-trace frame
+# gaps of ~19-22ms rather than a flat 20ms). _pump_agent_audio enqueues
+# received chunks and _outbound_pacer drains them at a steady real-time
+# cadence, so mod_livekit always sees an evenly-paced 20ms cadence instead of
+# LiveKit's raw jitter passed straight through. If delivery bursts and a
+# backlog builds up anyway, drop the oldest (stale) chunks past this many
+# frames to stay live rather than let latency grow. 10 frames == 200 ms.
+OUTBOUND_CATCHUP = 10
 
 # Agent speech-onset detection (outbound). The agent publishes a continuous
 # track (silence between utterances), so we detect "agent started speaking" by
@@ -135,6 +146,7 @@ class Session:
         self.source: rtc.AudioSource | None = None
         self._send_lock = asyncio.Lock()
         self._inbound: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+        self._outbound: asyncio.Queue[bytes] = asyncio.Queue()
         self._tasks: list[asyncio.Task] = []
         self._closed = asyncio.Event()
         # outbound bookkeeping for messages we send back to Awaaz
@@ -384,6 +396,7 @@ class Session:
             self._agent_ready = True
             self._maybe_open_capture()
             self._tasks.append(asyncio.create_task(self._pump_agent_audio(track)))
+            self._tasks.append(asyncio.create_task(self._outbound_pacer()))
 
     def _maybe_open_capture(self):
         if not DEBUG_CAPTURE_AGENT_AUDIO:
@@ -405,6 +418,11 @@ class Session:
 
     async def _pump_agent_audio(self, track: rtc.Track):
         # Ask LiveKit to resample the agent's audio (usually 48 kHz) down to 8 kHz.
+        # Chunks are handed to _outbound and drained by _outbound_pacer at a
+        # steady real-time cadence, rather than sent immediately here --
+        # LiveKit's own delivery timing has natural network/SFU jitter, and
+        # sending as soon as each chunk arrives would pass that jitter
+        # straight through to mod_livekit.
         stream = rtc.AudioStream(track, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS)
         try:
             async for event in stream:
@@ -412,9 +430,35 @@ class Session:
                 while len(self._outbuf) >= CHUNK_BYTES:
                     chunk = bytes(self._outbuf[:CHUNK_BYTES])
                     del self._outbuf[:CHUNK_BYTES]
-                    await self._send_media(chunk)
+                    self._outbound.put_nowait(chunk)
         finally:
             await stream.aclose()
+
+    async def _outbound_pacer(self):
+        """Drain _outbound at a steady real-time 20ms cadence (same clocked
+        approach scripts/file_playback_connector.py uses for its test
+        playback loop), so mod_livekit always receives evenly-paced frames
+        regardless of jitter in LiveKit's own delivery timing."""
+        next_send = time.monotonic()
+        while not self._closed.is_set():
+            chunk = await self._outbound.get()
+            if self._outbound.qsize() > OUTBOUND_CATCHUP:
+                dropped = 0
+                while self._outbound.qsize() > OUTBOUND_CATCHUP:
+                    try:
+                        chunk = self._outbound.get_nowait()
+                        dropped += 1
+                    except asyncio.QueueEmpty:
+                        break
+                log.warning("[%s] outbound catch-up: dropped %d stale agent frames "
+                            "(~%d ms) to stay live", self.stream_sid, dropped, dropped * 20)
+            await self._send_media(chunk)
+            next_send += FRAME_MS / 1000
+            sleep_for = next_send - time.monotonic()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+            else:
+                next_send = time.monotonic()
 
     # -- us -> Awaaz -------------------------------------------------------
 
